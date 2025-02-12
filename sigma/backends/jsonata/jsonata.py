@@ -1,12 +1,14 @@
+from sigma.conversion.deferred import DeferredQueryExpression
 from sigma.conversion.state import ConversionState
 from sigma.rule import SigmaRule
 from sigma.conversion.base import TextQueryBackend
-from sigma.conditions import ConditionItem, ConditionAND, ConditionOR, ConditionNOT
-from sigma.types import SigmaCompareExpression, SigmaRegularExpression, SigmaRegularExpressionFlag
+from sigma.conditions import ConditionItem, ConditionAND, ConditionOR, ConditionNOT, ConditionFieldEqualsValueExpression
+from sigma.types import SigmaCompareExpression, SigmaRegularExpression, SigmaRegularExpressionFlag, SpecialChars, SigmaString, SigmaCIDRExpression
 # from sigma.pipelines.jsonata import # TODO: add pipeline imports or delete this line
 import sigma
 import re
-from typing import ClassVar, Dict, Tuple, Pattern, List, Any, Optional
+from typing import ClassVar, Dict, Tuple, Pattern, List, Any, Optional, Union
+
 
 class JSONataBackend(TextQueryBackend):
     """jsonata backend."""
@@ -36,7 +38,7 @@ class JSONataBackend(TextQueryBackend):
     # String output
     ## Fields
     ### Quoting
-    field_quote : ClassVar[str] = "'"                               # Character used to quote field characters if field_quote_pattern matches (or not, depending on field_quote_pattern_negation). No field name quoting is done if not set.
+    field_quote : ClassVar[str] = "\""                               # Character used to quote field characters if field_quote_pattern matches (or not, depending on field_quote_pattern_negation). No field name quoting is done if not set.
     field_quote_pattern : ClassVar[Pattern] = re.compile("^\\w+$")   # Quote field names if this pattern (doesn't) matches, depending on field_quote_pattern_negation. Field name is always quoted if pattern is not set.
     field_quote_pattern_negation : ClassVar[bool] = True            # Negate field_quote_pattern result. Field name is quoted if pattern doesn't matches if set to True (default).
 
@@ -48,8 +50,8 @@ class JSONataBackend(TextQueryBackend):
     ## Values
     str_quote       : ClassVar[str] = '\"'     # string quoting character (added as escaping character)
     escape_char     : ClassVar[str] = "\\"    # Escaping character for special characrers inside string
-    # wildcard_multi  : ClassVar[str] = "*"     # Character used as multi-character wildcard
-    # wildcard_single : ClassVar[str] = "*"     # Character used as single-character wildcard
+    wildcard_multi  : ClassVar[str] = "*"     # Character used as multi-character wildcard
+    wildcard_single : ClassVar[str] = "*"     # Character used as single-character wildcard
     add_escaped     : ClassVar[str] = "\\"    # Characters quoted in addition to wildcards and string quote
     filter_chars    : ClassVar[str] = ""      # Characters filtered
     bool_values     : ClassVar[Dict[bool, str]] = {   # Values to which boolean values are mapped.
@@ -61,7 +63,7 @@ class JSONataBackend(TextQueryBackend):
     startswith_expression : ClassVar[str] = "$match({field}, /^{value}/)"
     endswith_expression   : ClassVar[str] = "$match({field}, /{value}$/)"
     contains_expression   : ClassVar[str] = "$contains({field}, {value})"
-    # wildcard_match_expression : ClassVar[str] = "{field} match {value}"      # Special expression if wildcards can't be matched with the eq_token operator
+    wildcard_match_expression: ClassVar[str] = "$match({field}, /{value}/)"  # Special expression if wildcards can't be matched with the eq_token operator
 
     # Regular expressions
     # Regular expression query as format string with placeholders {field}, {regex}, {flag_x} where x
@@ -93,7 +95,7 @@ class JSONataBackend(TextQueryBackend):
 
     # CIDR expressions: define CIDR matching if backend has native support. Else pySigma expands
     # CIDR values into string wildcard matches.
-    cidr_expression : ClassVar[Optional[str]] = None  # CIDR expression query as format string with placeholders {field}, {value} (the whole CIDR value), {network} (network part only), {prefixlen} (length of network mask prefix) and {netmask} (CIDR network mask only).
+    cidr_expression : ClassVar[Optional[str]] = "$match({field}, /{network}\\..*/)"  # CIDR expression query as format string with placeholders {field}, {value}, {network}, {prefixlen}, and {netmask}.
 
     # Numeric comparison operators
     compare_op_expression : ClassVar[str] = "{field} {operator} {value}"  # Compare operation query as format string with placeholders {field}, {operator} and {value}
@@ -196,4 +198,90 @@ class JSONataBackend(TextQueryBackend):
 
     def escape_and_quote_field(self, field_name: str) -> str:
         new_field_name = super().escape_and_quote_field(field_name)
+
+        # Check if field_escape_pattern in field_name
+        if self.field_escape_pattern.search(field_name):
+            new_field_name = '$.' + new_field_name
+
         return new_field_name
+
+    def convert_condition_field_eq_val_str(
+        self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
+    ) -> Union[str, DeferredQueryExpression]:
+        """Conversion of field = string value expressions"""
+        try:
+            if (  # Check conditions for usage of 'startswith' operator
+                self.startswith_expression
+                is not None  # 'startswith' operator is defined in backend
+                and cond.value.endswith(SpecialChars.WILDCARD_MULTI)  # String ends with wildcard
+                and (
+                    self.startswith_expression_allow_special
+                    or not cond.value[:-1].contains_special()
+                )  # Remainder of string doesn't contains special characters or it's allowed
+            ):
+                expr = (
+                    self.startswith_expression
+                )  # If all conditions are fulfilled, use 'startswith' operator instead of equal token
+                value = cond.value[:-1]
+            elif (  # Same as above but for 'endswith' operator: string starts with wildcard and doesn't contains further special characters
+                self.endswith_expression is not None
+                and cond.value.startswith(SpecialChars.WILDCARD_MULTI)
+                and (
+                    self.endswith_expression_allow_special or not cond.value[1:].contains_special()
+                )
+            ):
+                expr = self.endswith_expression
+                value = cond.value[1:]
+            elif (  # contains: string starts and ends with wildcard
+                self.contains_expression is not None
+                and cond.value.startswith(SpecialChars.WILDCARD_MULTI)
+                and cond.value.endswith(SpecialChars.WILDCARD_MULTI)
+                and (
+                    self.contains_expression_allow_special
+                    or not cond.value[1:-1].contains_special()
+                )
+            ):
+                expr = self.contains_expression
+                value = cond.value[1:-1]
+            elif (  # wildcard match expression: string contains wildcard
+                self.wildcard_match_expression is not None and cond.value.contains_special()
+            ):
+                expr = self.wildcard_match_expression
+                value = cond.value.to_regex(self.add_escaped_re)
+            else:
+                expr = self.eq_expression
+                value = cond.value
+            return expr.format(
+                field=self.escape_and_quote_field(cond.field),
+                value=self.convert_value_str(value, state),
+                regex=self.convert_value_re(value.to_regex(self.add_escaped_re), state),
+                backend=self,
+            )
+        except TypeError:  # pragma: no cover
+            raise NotImplementedError(
+                "Field equals string value expressions with strings are not supported by the backend."
+            )
+
+    def convert_condition_field_eq_val_cidr(
+        self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
+    ) -> Union[str, DeferredQueryExpression]:
+        """Conversion of field matches CIDR value expressions."""
+        cidr: SigmaCIDRExpression = cond.value
+        if self.cidr_expression is not None:
+            return self.cidr_expression.format(
+                field=self.escape_and_quote_field(cond.field),
+                value=str(cidr.network),
+                network=cidr.network.network_address,
+                prefixlen=cidr.network.prefixlen,
+                netmask=cidr.network.netmask,
+            )
+        else:
+            expanded = cidr.expand()
+            expanded_cond = ConditionOR(
+                [
+                    ConditionFieldEqualsValueExpression(cond.field, SigmaString(network))
+                    for network in expanded
+                ],
+                cond.source,
+            )
+            return self.convert_condition(expanded_cond, state)
