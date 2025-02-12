@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "pySigma-backend-jsonata"
+version = "0.1.0"
+description = "pySigma jsonata backend"
+authors = ["Alex Sinnott <alex@north.sh>"]
+license = "MIT"
+repository = "https://github.com/sifex/pySigma-backend-jsonata"
+packages = [
+    { include = "sigma" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pysigma = "^0.11.19"
+
+[tool.poetry.group.dev.dependencies]
+defusedxml = "^0.7"
+pytest = "^8.3.4"
+pytest-cov = "^6.0.0"
+coverage = "^7.6.12"
+
+[build-system]
+requires = ["poetry-core>=1.8.1"]
+build-backend = "poetry.core.masonry.api"
